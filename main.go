@@ -1,9 +1,12 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -46,8 +49,18 @@ func main() {
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	}
 
-	// Handler wraps proxy.ServeHTTP and implements log levels.
+	// Handler wraps proxy.ServeHTTP and implements log levels. It also
+	// handles connection upgrades (websocket/other) by proxying the raw
+	// connection between client and backend so streaming works.
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Detect upgrade requests (e.g. websocket)
+		if isUpgradeRequest(r) {
+			if err := proxyUpgrade(w, r, u); err != nil {
+				log.Printf("ERROR: upgrade proxy %s %s from %s: %v", r.Method, r.URL.String(), r.RemoteAddr, err)
+				http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			}
+			return
+		}
 		lvl := strings.ToLower(*logLevel)
 		switch lvl {
 		case "verbose":
@@ -77,4 +90,70 @@ func main() {
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
+}
+
+// isUpgradeRequest returns true if the incoming request asks to upgrade the
+// connection (commonly used for WebSockets).
+func isUpgradeRequest(r *http.Request) bool {
+	up := r.Header.Get("Connection")
+	if strings.EqualFold(up, "upgrade") {
+		return true
+	}
+	// Some clients send multiple header values, check for substring.
+	if strings.Contains(strings.ToLower(up), "upgrade") {
+		return true
+	}
+	return r.Header.Get("Upgrade") != ""
+}
+
+// proxyUpgrade performs a raw TCP proxy between the client and the backend
+// for upgrade requests. It dials the backend using the scheme/host from u
+// and forwards bytes in both directions.
+func proxyUpgrade(w http.ResponseWriter, r *http.Request, u *url.URL) error {
+	// Hijack client connection
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		return fmt.Errorf("response writer does not support hijacking")
+	}
+	clientConn, clientBuf, err := hj.Hijack()
+	if err != nil {
+		return fmt.Errorf("hijack failed: %w", err)
+	}
+	defer func() {
+		_ = clientConn.Close()
+	}()
+
+	// Connect to backend
+	backendAddr := u.Host
+	// Ensure host has a port if missing (Url.Parse guarantees when scheme present)
+	var backendConn net.Conn
+	if u.Scheme == "https" {
+		backendConn, err = tls.Dial("tcp", backendAddr, &tls.Config{InsecureSkipVerify: true})
+	} else {
+		backendConn, err = net.Dial("tcp", backendAddr)
+	}
+	if err != nil {
+		return fmt.Errorf("dial backend %s: %w", backendAddr, err)
+	}
+	defer func() { _ = backendConn.Close() }()
+
+	// Write the request line and headers to the backend (preserve original)
+	if err := r.Write(backendConn); err != nil {
+		return fmt.Errorf("writing request to backend: %w", err)
+	}
+
+	// Now proxy bytes between clientConn and backendConn
+	errc := make(chan error, 2)
+	go func() {
+		_, e := io.Copy(backendConn, clientBuf)
+		errc <- e
+	}()
+	go func() {
+		_, e := io.Copy(clientConn, backendConn)
+		errc <- e
+	}()
+
+	// Wait for one side to finish or error
+	e := <-errc
+	return e
 }

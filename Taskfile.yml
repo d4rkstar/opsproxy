@@ -1,0 +1,204 @@
+version: '3'
+
+vars:
+  os:
+    sh: |
+      # Resolve OS in a portable way (fallback to go env when uname isn't available)
+      uname_s=$(uname -s 2>/dev/null || true)
+      if [ -z "$uname_s" ]; then
+        go env GOOS 2>/dev/null || echo windows
+      else
+        case "$uname_s" in
+          Darwin*) echo darwin ;;
+          Linux*)  echo linux  ;;
+          *)        echo windows ;;
+        esac
+      fi
+    ps: |
+      # PowerShell path: prefer go env, fallback to 'windows'
+      try {
+        $g = (& go env GOOS) -replace '\r',''
+        if ($g -and $g -ne '') { Write-Output $g } else { Write-Output 'windows' }
+      } catch { Write-Output 'windows' }
+
+  arch:
+    sh: |
+      uname_m=$(uname -m 2>/dev/null || true)
+      if [ -z "$uname_m" ]; then
+        go env GOARCH 2>/dev/null || echo amd64
+      else
+        case "$uname_m" in
+          arm64|aarch64) echo arm64 ;;
+          x86_64|amd64)  echo amd64 ;;
+          *)             echo "$uname_m" ;;
+        esac
+      fi
+    ps: |
+      try {
+        $a = (& go env GOARCH) -replace '\r',''
+        if ($a -and $a -ne '') { Write-Output $a } else { Write-Output 'amd64' }
+      } catch { Write-Output 'amd64' }
+
+  OS:
+    sh: |
+      # Uppercase alias for compatibility with shell expansions inside cmds
+      uname_s=$(uname -s 2>/dev/null || true)
+      if [ -z "$uname_s" ]; then
+        go env GOOS 2>/dev/null || echo windows
+      else
+        case "$uname_s" in
+          Darwin*) echo darwin ;;
+          Linux*)  echo linux  ;;
+          *)        echo windows ;;
+        esac
+      fi
+    ps: |
+      try {
+        $g = (& go env GOOS) -replace '\r',''
+        if ($g -and $g -ne '') { Write-Output $g } else { Write-Output 'windows' }
+      } catch { Write-Output 'windows' }
+
+  ARCH:
+    sh: |
+      uname_m=$(uname -m 2>/dev/null || true)
+      if [ -z "$uname_m" ]; then
+        go env GOARCH 2>/dev/null || echo amd64
+      else
+        case "$uname_m" in
+          arm64|aarch64) echo arm64 ;;
+          x86_64|amd64)  echo amd64 ;;
+          *)             echo "$uname_m" ;;
+        esac
+      fi
+    ps: |
+      try {
+        $a = (& go env GOARCH) -replace '\r',''
+        if ($a -and $a -ne '') { Write-Output $a } else { Write-Output 'amd64' }
+      } catch { Write-Output 'amd64' }
+
+tasks:
+  build:linux-amd64:
+    desc: build linux/amd64
+    cmds:
+      - mkdir -p dist
+      - CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/opsproxy-linux-amd64 main.go
+
+  build:linux-arm64:
+    desc: build linux/arm64
+    cmds:
+      - mkdir -p dist
+      - CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/opsproxy-linux-arm64 main.go
+
+  build:mac-amd64:
+    desc: build mac-amd64
+    cmds:
+      - mkdir -p dist
+      - CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/opsproxy-mac-amd64 main.go
+  
+  build:mac-arm64:
+    desc: build mac-arm64
+    cmds:
+      - mkdir -p dist
+      - CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/opsproxy-mac-arm64 main.go
+
+
+  build:windows-amd64:
+    desc: build Windows amd64
+    cmds:
+      - mkdir -p dist
+      - CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/opsproxy-windows-amd64.exe main.go
+
+  build:all:
+    desc: build all supported platforms (darwin/linux/windows; amd64/arm64)
+    cmds:
+      - mkdir -p dist
+      - |
+        set -euo pipefail
+        targets=(
+          "darwin:arm64"
+          "darwin:amd64"
+          "linux:arm64"
+          "linux:amd64"
+          "windows:amd64"
+        )
+        for t in "${targets[@]}"; do
+          IFS=":" read -r os arch <<< "$t"
+          out="dist/opsproxy-${os}-${arch}"
+          ext=""
+          if [ "$os" = "windows" ]; then ext=".exe"; fi
+          echo "Building $os/$arch -> ${out}${ext}"
+          CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w" -o "${out}${ext}" main.go
+        done
+
+  build:
+    desc: build for the current host (convenience)
+    silent: true
+    cmds:
+      - echo "Building"
+      - |
+        case "$(uname -s)" in
+          Darwin*)
+            case "$(uname -m)" in
+              arm64)
+                task build:mac-arm64
+                ;;
+              *)
+                task build:mac-amd64
+                ;;
+            esac
+            ;;
+          Linux*)
+            task build:linux-amd64
+            ;;
+          *)
+            task build:windows-amd64
+            ;;
+        esac
+  
+  run:
+    desc: run the proxy
+    silent: true
+    cmds:
+      - |
+        # Delegate to platform-specific runner. Prefer uname detection for *nix, fallback to go env.
+        uname_s=$(uname -s 2>/dev/null || true)
+        case "$uname_s" in
+          CYGWIN*|MINGW*|MSYS*|*NT-*) task run:windows ;;
+          Darwin*|Linux*|"" ) task run:unix ;;
+          *) task run:windows ;;
+        esac
+
+  run:unix:
+    desc: run proxy on unix-like systems
+    cmds:
+      - mkdir -p dist
+      - |
+        set -euo pipefail
+        os="{{.OS}}"
+        arch="{{.ARCH}}"
+        ext=""
+        if [ "$os" = "windows" ]; then ext=".exe"; fi
+        bin="dist/opsproxy-${os}-${arch}${ext}"
+        if [ ! -f "$bin" ]; then
+          echo "Binary $bin not found. Building for ${os}/${arch}..."
+          CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w" -o "$bin" main.go
+        fi
+        echo "Starting $bin"
+        exec "$bin"
+
+  run:windows:
+    desc: run proxy on Windows (PowerShell)
+    cmds:
+      - >-
+        powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& {
+          if (-not (Test-Path -Path 'dist')) { New-Item -ItemType Directory -Path 'dist' | Out-Null }
+          $os = '{{.OS}}'; $arch = '{{.ARCH}}'; $ext = '.exe';
+          $bin = Join-Path -Path 'dist' -ChildPath \"opsproxy-$($os)-$($arch)$ext\";
+          if (-not (Test-Path -Path $bin)) {
+            Write-Host \"Binary $bin not found. Building for $os/$arch...\";
+            & go build -trimpath -ldflags \"-s -w\" -o $bin main.go
+          }
+          Write-Host \"Starting $bin\";
+          & $bin
+        }"
+
